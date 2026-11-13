@@ -1,0 +1,87 @@
+[tool.black]
+line-length = 120
+
+[tool.mypy]
+python_version = "3.10"
+warn_unused_configs = true
+warn_redundant_casts = true
+strict_equality = true
+show_error_codes = true
+
+# Roadmap: these can be enabled after fixing the errors
+no_implicit_optional = true
+disallow_untyped_decorators = true
+check_untyped_defs = false  # 58 errors
+warn_return_any = false  # 62 errors
+
+exclude = [
+    "ydb/_grpc/v3/",
+    "ydb/_grpc/v4/",
+    "ydb/_grpc/v5/",
+    "ydb/_grpc/v6/",
+    "ydb.sqlalchemy.*",
+    "tests/",
+    "examples/",
+    "docs/",
+    # Exclude test files inside ydb directory
+    ".*_test\\.py$",
+]
+
+# External dependencies - ignore missing imports
+[[tool.mypy.overrides]]
+module = [
+    "google.protobuf.*",
+    "grpc.*",
+    "aiohttp.*",
+    "yandexcloud.*",
+    "yandex.cloud.*",
+    "jwt.*",
+    "kikimr.*",
+    "sqlalchemy.*",
+    "requests.*",
+    "ydb.public.api.*",
+    "contrib.ydb.public.api.*",
+    "opentelemetry.*",
+]
+ignore_missing_imports = true
+
+# Types and Table modules - protobuf stubs don't expose enum values correctly
+[[tool.mypy.overrides]]
+module = ["ydb.types", "ydb.table"]
+disable_error_code = ["attr-defined"]
+
+# Generated protobuf stubs are checked when they are generated, not as SDK source.
+[[tool.mypy.overrides]]
+module = [
+    "ydb._grpc.v3.*",
+    "ydb._grpc.v4.*",
+    "ydb._grpc.v5.*",
+    "ydb._grpc.v6.*",
+]
+ignore_errors = true
+
+[tool.coverage.run]
+branch = true
+source = ["ydb"]
+# Auto-generated protobuf stubs and test files must not skew the metric.
+omit = [
+    "ydb/_grpc/v3/*",
+    "ydb/_grpc/v4/*",
+    "ydb/_grpc/v5/*",
+    "ydb/_grpc/v6/*",
+    "*_test.py",
+    # Legacy, no longer actively developed.
+    "ydb/dbapi/*",
+    "ydb/sqlalchemy/*",
+]
+
+[tool.coverage.report]
+show_missing = true
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "@(abc\\.)?abstractmethod",
+]
+
+[tool.coverage.html]
+directory = "cov_html"

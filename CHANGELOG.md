@@ -1,0 +1,716 @@
+## 3.35.0 ##
+* Include streaming queries in scheme directory listings and path descriptions
+* Add timeout to the token exchange request so a stalled token endpoint cannot hang credential refresh
+* Fix topic reader `close()` hanging forever when the stream is broken with uncommitted offsets pending: the commit flush now stops as soon as the stream reports an error instead of waiting for acks that can never arrive
+* Fix async table session pool capacity leaking when keeping an idle session alive fails or is cancelled
+
+## 3.34.0 ##
+* Remove `AAA Certificate Services` and `emSign ECC Root CA - G3` from the bundled TLS trust store to reject certificate chains affected by the eMudhra CA compromise
+* Fix topic writer batching to include message metadata and protobuf overhead in request size calculations
+
+## 3.33.2 ##
+* Fix sync `QuerySessionPool` and `QuerySession.create()` hanging for 600 seconds and then failing with a non-retriable `TimeoutError` when a new session's attach stream fails before its first message (e.g. during a node restart); the attach error is now raised immediately, so retriable errors such as `Unavailable` are retried
+## 3.33.1 ##
+* Add `ydb.convert_floats_to_embedding_bytes` to encode numeric vectors for YDB KNN queries
+
+## 3.33.0 ##
+* Fix memory leak in ydb.aio.retry_operation
+* Deprecated the table client scan query methods — `TableClient.scan_query`, `TableClient.async_scan_query` and the async `ydb.aio.TableClient.scan_query`: they now emit a `DeprecationWarning` and keep working as before, use QueryService (`ydb.QuerySessionPool` / `ydb.aio.QuerySessionPool`) instead
+* Mark the package as typed so type checkers use the SDK's inline annotations
+
+## 3.32.0 ##
+* Add `TableClient.read_rows` (sync and async) to read rows by primary key without a transaction
+* Add the `ydb.query.session.closed` counter for query session pool closures, labeled by pool name and a standardized closure reason; metrics-enabled clients now advertise `ydb-sdk-metrics/0.2.0` in `x-ydb-sdk-build-info`
+* Fix query-session gauges after session invalidation and metrics reconfiguration: closed sessions no longer appear as negative `used` or phantom `idle` sessions, provider replacement preserves instrumented pool state without leaking observations to old providers, and pools created with metrics disabled use zero-cost shared no-op lifecycle instrumentation
+
+## 3.31.5 ##
+* Fixed `OSError: [Errno 22] Invalid argument` when reading native `Datetime64` value before 1970 (negative Unix timestamps) on Windows: conversion now uses epoch arithmetic instead of `datetime.utcfromtimestamp`
+* Add `return_not_null_data_as_optional` parameter to `read_table` (sync and async) — allows reading `NOT NULL` columns as non-optional types, matching the existing gRPC field and the C++ SDK's `ReturnNotNullAsOptional`. By default `read_table` still wraps `NOT NULL` columns in `Optional` for backward compatibility
+
+## 3.31.4 ##
+* Fixed async `QuerySessionPool` permanently losing a pool slot when `acquire()` was cancelled while a new session was being created: `asyncio.CancelledError` no longer leaks the pool size counter, so a pool under deadline-driven cancellations can no longer end up exhausted and blocking forever. A cancelled or interrupted session attach now also closes the session instead of orphaning it server-side
+
+## 3.31.3 ##
+* Add `SchemeEntry.interrupt_permission_inheritance`, reported by `describe_path` and `list_directory`, telling whether the object inherits permissions from its parents
+
+## 3.31.2 ##
+* Add `TableClient.describe_system_view` (sync and async) returning a dedicated `SystemViewSchemeEntry` with the system view id, name, columns, primary key and attributes — a full description of system view objects that `describe_table` does not provide
+* Add `pool_id` parameter to `QuerySession.execute`, `QueryTxContext.execute`, and `QuerySessionPool.execute_with_retries` to route queries to a specific resource pool
+
+## 3.31.1 ##
+* Support the new `SECRET` scheme entry type: `SchemeEntryType.SECRET` and `SchemeEntry.is_secret()` now recognise secret entries returned by `list_directory`/`describe_path`
+
+## 3.31.0 ##
+* Fixed `execute_with_retries` returning a large result set split across several `ResultSet` objects: row-format stream parts that share a `result_set_index` are now concatenated back into a single result set, so a large SELECT is returned as one result set instead of one per stream chunk
+* Introduce `ydb.observability` — vendor-neutral tracing entrypoint with a `TracingProvider` interface; `enable_tracing(provider)` accepts any implementation (custom or OpenTelemetry) and replaces the previously installed one. The SDK core no longer imports `opentelemetry`, so tracing can be enabled without the OpenTelemetry packages by supplying a custom provider
+* When tracing is enabled the SDK appends a `ydb-sdk-tracing/0.1.0` token to the `x-ydb-sdk-build-info` header, so the server can distinguish requests from tracing-enabled clients
+* Add client-side metrics through the same vendor-neutral `ydb.observability` layer: `enable_metrics(provider)` / `disable_metrics()`, with `ydb.opentelemetry.enable_metrics(meter_provider=None)` as the OpenTelemetry convenience. Instruments cover client operation duration/failures, retry duration/attempts, and query session pool state. `QuerySessionPool` gains an optional `name` argument for the pool metric label. When metrics are enabled the SDK appends a `ydb-sdk-metrics/0.1.0` token to the `x-ydb-sdk-build-info` header
+
+## 3.30.0 ##
+* Query session attach stream handles `NodeShutdown` and `SessionShutdown` session hints: on `NodeShutdown` the session's node connection is pessimized and the session is retired, on `SessionShutdown` the session is retired without touching the node
+* Honor the `max_bytes` parameter in topic reader `receive_batch`/`receive_batch_with_tx` (previously accepted but silently ignored); add `max_bytes` to the async reader as well
+* Support the timezone-carrying types `TzDate`, `TzDatetime` and `TzTimestamp` in query results and parameters (reading them previously raised `AttributeError`)
+* Drop support for Python 3.8 and 3.9; the minimum supported version is now Python 3.10
+* Accept native `datetime.datetime` values for `Datetime` and `Datetime64` query parameters (previously only integer seconds since the epoch were accepted)
+
+## 3.29.7 ##
+* Make missing row/struct attribute access raise an error that is both AttributeError and KeyError, to stay backward compatible with callers written against the pre-3.29.5 KeyError
+
+## 3.29.6 ##
+* Restore attribute assignment on query result set rows (broken by the result set memory optimization)
+
+## 3.29.5 ##
+* Fix gRPC thread leak on failed topic writer reconnect
+* Reduce memory usage of query service result sets
+* Update protobufs
+* Fix incompatibility with protobuf 6.30–6.31.0: regenerate v6 stubs with the lowest 6.x gencode floor (6.30.0) instead of 6.31.1
+
+## 3.29.4 ##
+* Fix leaked topic reader stream when close interrupts stream creation during reconnect
+* Include reconnector and read session ids in topic reader logs
+
+## 3.29.3 ##
+* Fix topic reader hang and zombie stream when closing during reconnect
+
+## 3.29.2 ##
+* Fix transactional topic reader committing stale offsets after reconnect
+
+## 3.29.1 ##
+* Fix driver.wait hang
+
+## 3.29.0 ##
+* Added OpenTelemetry tracing support via `ydb.opentelemetry.enable_tracing()`
+
+## 3.28.4 ##
+* Fix iam module lazy loading
+
+## 3.28.3 ##
+* Fix session invalidation scheme
+
+## 3.28.2 ##
+* Invalidate session on cancelled / transport stream errors
+
+## 3.28.1 ##
+* Invalidate session on interrupted rollback
+* Added acquire timeout to QuerySessionPool
+
+## 3.28.0 ##
+* Reader buffer release threshold feature
+
+## 3.27.0 ##
+* Topic Writer Backpressure
+* Update writer debug logs
+
+## 3.26.10 ##
+* Fix asyncio.Cancelled error propagated to writer/reader
+* add nearest DC detection with TCP race
+
+## 3.26.9 ##
+* Send writers messages as one batch
+
+## 3.26.8 ##
+* Make "Sent message larger than max" error non retryable
+* Better observability for errors in token refresh
+
+## 3.26.7 ##
+* Ability to pass additional info to sdk header
+
+## 3.26.6 ##
+* Support YDB_USER and YDB_PASSWORD in the environment
+
+## 3.26.5 ##
+* Retry SessionExpired in topic streams
+
+## 3.26.4 ##
+* Make fail to create session log warn
+
+## 3.26.3 ##
+* Fix GrpcWrapperAsyncIO.close for OpenTelemetry intercepted streams
+
+## 3.26.2 ##
+* Fix possible race condition in topic common
+
+## 3.26.1 ##
+* Fix discovery timeout
+
+## 3.26.0 ##
+* Basic mypy support and extended typehints
+* Drop compatibility with python 3.7
+
+## 3.25.0 ##
+* Add protobuf 6 support
+
+## 3.24.1 ##
+* Use session's node_id as preferred endpoint
+* Fix attach stream finish logic
+
+## 3.24.0 ##
+* Refactor session lifecycle
+* Make DeadlineExceeded not retriable
+
+## 3.23.4 ##
+* Allow rollback after TLI
+
+## 3.23.3 ##
+* Make attach session error readable
+
+## 3.23.2 ##
+* QuerySessionPool: Cancel queue.get in case of cancel of parent coroutine
+
+## 3.23.1 ##
+* Added SysView scheme type
+
+## 3.23.0 ##
+* Coordination Service experimental support
+
+## 3.22.4 ##
+* Update default keepalive time to 10s
+
+## 3.22.3 ##
+* Make commit_offset call retryable
+
+## 3.22.2 ##
+* Make use_all_nodes True by default
+
+## 3.22.1 ##
+* Fix crash on discovery thread
+
+## 3.22.0 ##
+* Support Arrow format of result sets in QueryService
+
+## 3.21.14 ##
+* Fixed bug with param read_from for topic reader
+
+## 3.21.13 ##
+* Refactor auth token refresh logic
+
+## 3.21.12 ##
+* Fix getattr propagation to wrapped stream
+
+## 3.21.11 ##
+* Fix is_view, is_resource_pool for SchemeEntryType
+
+## 3.21.10 ##
+* Fix stream error handling
+
+## 3.21.9 ##
+* Add method explain for explain query to QuerySession and QuerySessionPool classes
+
+## 3.21.8 ##
+* Fix: convert gRPC stream termination to YDB errors in async query client
+
+## 3.21.7 ##
+* Remove default timeout from topic stream
+
+## 3.21.6 ##
+* Wrap prepare execute request exceptions to ydb.Error
+* Add async methods to QuerySessionPool
+* Add default grpc keepalive value
+* Add detailed debug logs to topic instances
+
+## 3.21.5 ##
+* Ability to create Date type from datetime
+
+## 3.21.4 ##
+* Add index to resultsets
+
+## 3.21.3 ##
+* Rename indexes feature
+
+## 3.21.2 ##
+* Add disable_discovery option to DriverConfig
+
+## 3.21.1 ##
+* Support Date32, Datetime64, Timestamp64, Interval64
+
+## 3.21.0 ##
+* Reader without Consumer
+* CommitOffset feature
+* QueryService stats support
+
+## 3.20.1 ##
+* Add missing fields to tablestats
+* Return topic destructors
+
+## 3.20.0 ##
+* Transactions between topics and tables
+* Remove QuerySessionPool desctuctors
+
+## 3.19.3 ##
+* Add consumer_stats to PublicConsumer
+
+## 3.19.2 ##
+* Fix async query pool acquire race condition
+
+## 3.19.1 ##
+* Fix dynconfig proto usage
+
+## 3.19.0 ##
+* protobuf 5 compatibility
+
+## 3.18.17 ##
+* Fix empty result sets from stream
+
+## 3.18.16 ##
+* Partition autosplit feature
+* Transactional retryer
+* Ignore AttributeError in ydb/import_client.py
+* add missing scheme entry types
+
+## 3.18.15 ##
+* Topic metadata feature
+
+## 3.18.14 ##
+* Fix cancel logic during SessionPool.acquire
+
+## 3.18.13 ##
+* Fix empty tx_id in tx meta
+
+## 3.18.12 ##
+* Fix aio auth credentials
+
+## 3.18.11 ##
+* Make created_at utc in topic writer
+
+## 3.18.10 ##
+* Update protofiles
+* Revert "Add backslash to database name if needed"
+
+## 3.18.9 ##
+* Add backslash to database name if needed
+* Fix attach session timeouts
+
+## 3.18.8 ##
+* Refactor aio tableclient destructor
+
+## 3.18.7 ##
+* Add an ability to pass custom event loop to QuerySessionPool
+
+## 3.18.6 ##
+* Add missing ability to configure QueryClientSettings
+
+## 3.18.5 ##
+* Fix table_client desctructor
+
+## 3.18.4 ##
+* Fix table_client desctructor
+
+## 3.18.3 ##
+* Hide session management for table client methods
+* Add build method to QueryOnlineReadOnly mode
+
+## 3.18.2 ##
+* Fix compatibility with arcadia
+
+## 3.18.1 ##
+* Add an ability to use both driver config and driver args
+* Added new way to create StaticCredentials
+
+## 3.18.0 ##
+* Ability to batch messages in topic reader
+* Implement max_messages on recieve_batch
+* Added badge for API reference
+* Remove experimental warn from query service
+* Remove asyncio task names for python below 3.8
+
+## 3.17.2 ##
+* Add data_columns support in TableIndex
+
+## 3.17.1 ##
+* New autogenerated docs
+* Add an ability to create async index
+
+## 3.17.0 ##
+* Query Session Pool redesign
+
+## 3.16.1 ##
+* SLO tests for query service
+* Fix connection close mechanism
+
+## 3.16.0 ##
+* Async implementation of Query Service SDK
+* New basic example with Query Service SDK
+
+## 3.15.0 ##
+* Query service client support
+* Add dunder version to ydb package
+* OAuth 2.0 token exchange. Allow multiple resource parameters in according to https://www.rfc-editor.org/rfc/rfc8693
+
+## 3.14.0 ##
+* Added load OAuth 2.0 token exchange credentials provider from config file
+
+## 3.13.1 ##
+* Moved grpc draft imports to draft folder
+
+## 3.13.0 ##
+* Added alter topic method
+
+## 3.12.3 ##
+* Fixed leak sessions on asyncio timeout
+* Fixed missed parameter in internal stream_reader.close() - reader hungs up
+
+## 3.12.2 ##
+* Added support ydb github repo with own auth protobuf
+
+## 3.12.1 ##
+* Fixed error while read the account key from a file (release version)
+
+## 3.12.1b1 ##
+* Fixed error while read the account key from a file
+
+## 3.12.0 ##
+* Supported service account key from memory, additional to file path
+
+## 3.11.4 ##
+* Added missing returns to time converters for topic options
+
+## 3.11.3 ##
+* Fixed datetime timezone aware usage
+
+## 3.11.2 ##
+* Fixed hungup topic reader on unknown codec
+
+## 3.11.1 ##
+* fixed unexpected require requests module on import
+
+## 3.11.0 ##
+* Implemented OAuth 2.0 Token Exchange credentials provider
+
+## 3.10.0 ##
+* Added is_column_store to SchemeEntryType and SchemeEntry classes
+
+## 3.9.1 ##
+yanked bad api release
+
+## 3.9.0 ##
+yanked bad api release
+
+## 3.8.1 ##
+* Fixed to handle deadline on topic stream in async driver.
+
+## 3.8.0 ##
+* Added clients for draft.BaseDynamicConfig service
+
+## 3.7.1 ##
+* Updated protobuf generated code
+
+## 3.7.0 ##
+* Added ExternalError issue
+
+## 3.6.0 ##
+* Added with_use_type_v3 to ExportToS3Settings
+
+## 3.5.2 ##
+* Set 1 thread as default for encode/decode messages, was 4
+* Added comments about calls encoders/decoders in parallel from multiply threads
+
+## 3.5.1 ##
+* Fixed access to connection if connection cannot be found by node id
+
+## 3.5.0 ##
+* Added functions for check column table type table of any type of scheme entry
+
+## 3.4.0 ##
+* Add to public topic reader api: TopicReaderBatch, wait_message
+
+## 3.3.7 ##
+* Added copy of locals() dicts at internals
+
+## 3.3.6 ##
+* Added list type to converter from result to native type (fix problem with get list result in dbapi/sqlalchemy)
+
+## 3.3.5 ##
+* Fixed use positional argument instead of named in WriterAsyncIO.__del__
+* Fixed release buffer while read topic by one messages
+* Fixed race condition between commit_with_ack and reconnect in topic writer
+
+## 3.3.4 ##
+* Fixed handle stop partition request from server
+
+## 3.3.3 ##
+* Fixed hang while write messages to closed driver
+* Removed fixed version of aiohttp
+
+## 3.3.2 ##
+* Fix keep DataQuery in local cache and set flag keep_in_cache for server
+
+## 3.3.1 ##
+* Fix exception for convert sync to async iterator
+* Fixed start many sync writers/readers in parallel
+
+## 3.3.0 ##
+* Added support to set many topics and topic reader settings for read in one reader
+* Added ydb.TopicWriterInitInfo, ydb.TopicWriteResult as public types
+* Check possible of create init message on create reader (faster fail with some bad params)
+* Raise exception for get session from stopped session pool
+* Add extend path for ydb (allow install other packages with names in ydb namespace
+
+## 3.2.2 ##
+* Fixed set keep_in_cache algorithm
+
+## 3.2.1 ##
+* Fixed ydb.credentials_from_env_variables, now it will use Metadata credentials by default (instead of anonymous).
+
+## 3.2.0 ##
+* Added return result for topic writer.write_with_ack
+
+## 3.1.1 ##
+* Fixed bug with ModuleNotFoundError while import ydb
+
+## 3.1.0 ##
+COMPLETE CHANGELOG FROM v2:
+* Add api for topic service
+
+BREAKING CHANGES:
+* deny any action in transaction after commit/rollback (switch to old behaviour with ydb.global_allow_split_transactions(True))
+* raise exception for truncated response by default (switch to old behavior with ydb.global_allow_truncated_result(True))
+* drop support python 2
+* Use anonymous credentials for auth by default instead of iam metadata (use ydb.driver.credentials_from_env_variables for creds by env var)
+
+## 3.0.1b13 ##
+* Fixed commit for sync reader
+* Group messages while send to server
+* Prevent stop topic client by GC while reader/writer alived
+
+## 3.0.1b12 ##
+* Added flush reader commits on reader close
+* Fix stop executor in python 3.8
+* Fix handle background errors
+
+## 3.0.1b11 ##
+* Fixed global_allow_split_transactions
+* Added reader.receive_message() method
+* Swap topic_path and consumer arguments in topic_client.reader method
+
+## 3.0.1b10 ##
+* fixed sqlalchemy get_columns method with not null columns
+* fixed requirements.txt
+
+## 3.0.1b9 ##
+* Add function for global revert broken behaviour: ydb.global_allow_truncated_result, ydb.global_allow_split_transactions
+* Change argument names from deny_split_transactions to allow_split_transactions (with reverse value
+* Fixed check retriable for idempotent error
+* Reader codecs
+* Read one message
+* fixed sqlalchemy get_columns method with not null columns
+
+## 3.0.1b8 ##
+* Fixed exception while create ResultSet with None table_settings
+
+## 3.0.1b7 ##
+* BROKEN CHANGE: deny any action in transaction after commit/rollback
+* BROKEN CHANGE: raise exception for truncated response by default
+* Compatible protobaf detection for arcadia
+* Add codecs support for topic writer
+
+## 3.0.1b6 ##
+* BROKEN CHANGES: remove writer.write(mess1, mess2) variant, use list instead: writer.write([mess1, mess2])
+* BROKEN CHANGES: change names of public method in topic client
+* BROKEN CHANGES: rename parameter producer_and_message_group_id to producer_id
+* producer_id is optional now
+
+## 3.0.1b5 ##
+* Remove six package from code and dependencies (remove support python2)
+* Use anonymous credentials by default instead of iam metadata (use ydb.driver.credentials_from_env_variables for creds by env var)
+* Close grpc streams while closing readers/writers
+* Add control plane operations for topic api: create, drop
+* Add six package to requirements
+
+## 3.0.1b4 ##
+* Initial implementation of topic reader
+
+## 3.0.1b3 ##
+* Fix error of check retriable error for idempotent operations (error exist since 2.12.1)
+
+## 3.0.1b2 ##
+* Add initial topic writer
+
+## 3.0.1b1 ##
+* start 3.0 beta branch
+
+## 2.13.4 ##
+* fixed sqlalchemy get_columns method with not null columns
+
+## 2.13.3 ##
+* fixed use transaction object when commit with flag
+
+## 2.13.2 ##
+* fix snapshot attribute in class _ResultSet
+
+## 2.13.1 ##
+* fixed set version in ydb_version file
+
+## 2.13.0 ##
+* fixed in to make compressed backups possible
+* Add snapshot to read table responses
+
+## 2.12.4 ##
+* Added functions for global change behaviour for compatible with future sdk version: ydb.global_allow_truncated_result and global_allow_split_transactions
+
+## 2.12.3 ##
+* Flag for deny split transaction
+* Add six package to requirements
+* Fixed error while passing date parameter in execute
+
+## 2.12.2 ##
+* Fix error of check retriable error for idempotent operations (error exist since 2.12.1)
+
+## 2.12.1 ##
+* Supported `TYPE_UNSPECIFIED` item type to scheme ls
+* Fixed error while request iam token with bad content type in metadata
+
+## 2.12.0 ##
+* Fixed error message while get token from metadata with asyncio iam
+* Add `SnapshotReadOnly` transaction mode support to `session.transaction`
+
+## 2.11.1 ##
+* Regenerate protobuf code from public api protos (some private protobufs was removed)
+* Remove internal S3 client code
+
+## 2.11.0 ##
+
+* removed unused experimental client from ydb python sdk.
+
+## 2.10.0 ##
+
+* fixed double quoting issue in sqlalchemy
+
+## 2.9.0 ##
+
+* fixed minor issue in SDK imports for Python 2.
+
+## 2.7.0 ##
+
+* fixes in TxContext in ydb.aio module.
+
+## 2.6.0 ##
+
+* support `with_native_interval_in_result_sets` flag in the table client.
+* support `with_native_timestamp_in_result_sets` flag in the table client.
+
+## 2.4.0 ##
+
+* support query stats in scan query
+
+## 2.2.0 ##
+
+* allow to refer endpoints by node id
+* support null type in queries
+* support session balancer feature
+
+## 2.1.0 ##
+
+* add compression support to ydb sdk
+
+## 1.1.16 ##
+
+* alias `kikimr.public.sdk.python.client` is deprecated. use `import ydb` instead.
+* alias `kikimr.public.api` is deprecated, use `ydb.public.api` instead.
+* method `construct_credentials_from_environ` is now deprecated and will be removed in the future.
+
+## 1.1.15 ##
+
+* override the default load balancing policy for discovery endpoint to the `round_robin` policy.
+
+## 1.1.14 ##
+
+* support session graceful shutdown protocol.
+
+## 1.1.11 ##
+
+* speedup driver initialization and first driver.wait
+
+## 1.1.10 ##
+
+ * add methods to request `_apis.TableService.RenameTables` call
+ * by now the call is disabled at the server side
+ * it will be enabled soon
+
+## 1.1.0 ##
+
+* remove useless `from_bytes` for PY3
+* improve performance of column parser
+
+## 1.0.27 ##
+
+* fix bug with prepare in aio
+
+## 1.0.26 ##
+
+* allow specifying column labels in group by in the sqlalchemy dialect
+
+## 1.0.25 ##
+
+* add SEQUENCE to known schema types
+
+## 1.0.22 ##
+
+* add `retry_operation` to `aio.SessionPool`
+
+## 1.0.21 ##
+
+* ydb.aio supports retry operation helper.
+
+## 1.0.20 ##
+
+* storage class support
+
+## 1.0.19 ##
+
+* add async `SessionPool` support
+
+## 1.0.18 ##
+
+* minor change in dbapi
+
+## 1.0.17 ##
+
+* add asyncio support
+
+## 1.0.14 ##
+
+* add some custom datatypes for sqlalchemy
+
+## 1.0.13 ##
+
+* change error format for sqlalchemy
+
+## 1.0.12 ##
+
+* add ``ValueSinceUnixEpochModeSettings`` support to ``TtlSettings``
+
+## 1.0.11 ##
+
+* add default credentials constructor
+
+## 1.0.10 ##
+
+* pass issues to dbapi errors
+
+## 1.0.9 ##
+
+* allow custom user agent
+
+## 1.0.8 ##
+
+* load YDB certificates by default
+
+## 1.0.7 ##
+
+* allow to fail fast on driver wait
+
+## 1.0.6 ##
+
+* disable client query cache by default
+
+## 1.0.3 ##
+
+* support uuid type
+
+## 1.0.1 ##
+
+* Support ``store_size`` in describe of table.
+
+## 1.0.0 ##
+
+* Start initial changelog.

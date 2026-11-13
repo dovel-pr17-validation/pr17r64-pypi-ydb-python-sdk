@@ -1,0 +1,23 @@
+__pycache__
+ydb.egg-info/
+/.idea
+/.vscode
+/tox
+/venv
+/.venv
+/ydb_certs
+/ydb_data
+/tmp
+.coverage
+.coverage.*
+/cov_html
+/coverage.xml
+/build
+docs/_build
+.DS_Store
+
+# AI tools
+.claude/
+.cursor/
+.aider*
+.windsurf/

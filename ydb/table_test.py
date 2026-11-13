@@ -1,0 +1,533 @@
+import copy
+
+import pytest
+
+from unittest import mock
+from . import issues, convert, types, _apis, scheme, _session_impl, _utilities
+from .aio import _utilities as _aio_utilities
+from .aio.table import TableClient as AioTableClient
+from .table import SystemViewSchemeEntry, TableClient, TableClientSettings
+
+from .retries import (
+    retry_operation_impl,
+    YdbRetryOperationFinalResult,
+    YdbRetryOperationSleepOpt,
+    RetrySettings,
+)
+
+
+def _build_int_result_set(n_rows, n_cols):
+    result_set = _apis.ydb_value.ResultSet()
+    for col_idx in range(n_cols):
+        column = result_set.columns.add()
+        column.name = "column_%d" % col_idx
+        column.type.type_id = types.PrimitiveType.Int64._idn_
+    for row_idx in range(n_rows):
+        row = result_set.rows.add()
+        for col_idx in range(n_cols):
+            row.items.add().int64_value = row_idx * 1000 + col_idx
+    return result_set
+
+
+def test_result_set_row_access():
+    message = _build_int_result_set(n_rows=1, n_cols=3)
+    row = convert.ResultSet.from_message(message).rows[0]
+
+    assert row["column_1"] == 1
+    assert row.column_1 == 1
+    assert row[1] == 1
+    assert row[0:2] == (0, 1)
+    assert dict(row) == {"column_0": 0, "column_1": 1, "column_2": 2}
+
+
+def test_result_set_row_keeps_data_out_of_instance_dict():
+    # Column values live in the dict base and `_columns` in a slot, never in a
+    # per-instance __dict__ that would be multiplied across every row. The
+    # __dict__ is lazy and stays empty until a caller attaches its own attribute.
+    message = _build_int_result_set(n_rows=1, n_cols=3)
+    row = convert.ResultSet.from_message(message).rows[0]
+    assert row.__dict__ == {}
+
+
+def test_result_set_row_allows_attribute_assignment():
+    # Rows expose a __dict__ so callers can attach computed fields onto them
+    # (ORM-style row.dt_created = ...); the memory optimization must keep that
+    # working while leaving read-only rows unburdened.
+    message = _build_int_result_set(n_rows=1, n_cols=3)
+    row = convert.ResultSet.from_message(message).rows[0]
+
+    row.dt_created = 123
+    assert row.dt_created == 123
+    assert row["column_0"] == 0
+
+
+def test_result_set_row_attribute_shadows_column():
+    # With a lazy __dict__, assigning an attribute that matches a column name
+    # shadows the column for attribute access (normal lookup finds __dict__
+    # before __getattr__ runs), while item access still reads the column value.
+    message = _build_int_result_set(n_rows=1, n_cols=3)
+    row = convert.ResultSet.from_message(message).rows[0]
+
+    row.column_0 = "override"
+    assert row.column_0 == "override"
+    assert row["column_0"] == 0
+
+    del row.column_0
+    assert row.column_0 == 0
+
+
+def test_lazy_result_set_row_allows_attribute_assignment():
+    # _LazyRow inherits the lazy __dict__ from _DotDict too.
+    message = _build_int_result_set(n_rows=1, n_cols=2)
+    row = convert.ResultSet.lazy_from_message(message).rows.fetchone()
+
+    row.dt_created = 123
+    assert row.dt_created == 123
+    assert row["column_0"] == 0
+
+
+def test_struct_value_allows_attribute_assignment():
+    # _Struct shares the lazy __dict__ from _DotDict.
+    struct = convert._Struct()
+    struct["a"] = 1
+
+    struct.computed = 2
+    assert struct.a == 1
+    assert struct.computed == 2
+
+
+def test_result_set_row_missing_attribute_raises_attribute_error():
+    message = _build_int_result_set(n_rows=1, n_cols=1)
+    row = convert.ResultSet.from_message(message).rows[0]
+
+    assert not hasattr(row, "definitely_missing")
+    with pytest.raises(AttributeError):
+        row.definitely_missing
+
+
+def test_result_set_row_missing_attribute_is_also_key_error():
+    # Before 3.29.5 dotted access to a missing field leaked KeyError; it now
+    # raises AttributeError. The combined error stays catchable as either, so
+    # callers written against the old behaviour keep working.
+    message = _build_int_result_set(n_rows=1, n_cols=1)
+    row = convert.ResultSet.from_message(message).rows[0]
+
+    with pytest.raises(KeyError):
+        row.definitely_missing
+
+    try:
+        row.definitely_missing
+    except Exception as e:
+        assert isinstance(e, AttributeError)
+        assert isinstance(e, KeyError)
+
+
+def test_result_set_row_is_copyable():
+    message = _build_int_result_set(n_rows=1, n_cols=3)
+    row = convert.ResultSet.from_message(message).rows[0]
+
+    assert dict(copy.copy(row)) == dict(row)
+    assert dict(copy.deepcopy(row)) == dict(row)
+    # _columns must survive the copy so integer/slice indexing keeps working.
+    assert copy.copy(row)[1] == 1
+    assert copy.deepcopy(row)[0:2] == (0, 1)
+
+
+def test_result_set_detached_from_source_message():
+    # The converted result set must not hold a reference into the source
+    # protobuf: otherwise the whole arena (raw rows included) stays alive for
+    # the lifetime of the result, doubling memory usage on large reads.
+    message = _build_int_result_set(n_rows=2, n_cols=2)
+    result = convert.ResultSet.from_message(message)
+
+    message.Clear()  # emulate the source proto being dropped/reused by the stream
+
+    assert [column.name for column in result.columns] == ["column_0", "column_1"]
+    # The DB-API cursor reads column.type on detached columns, so it must survive too.
+    assert result.columns[0].type.type_id == types.PrimitiveType.Int64._idn_
+    assert result.rows[0]["column_1"] == 1
+    assert result.rows[1][0] == 1000
+    assert result.rows[1][0:2] == (1000, 1001)
+
+
+def test_retry_operation_impl(monkeypatch):
+    monkeypatch.setattr("random.random", lambda: 0.5)
+    monkeypatch.setattr(
+        issues.Error,
+        "__eq__",
+        lambda self, other: type(self) is type(other) and self.message == other.message,
+    )
+
+    retry_once_settings = RetrySettings(
+        max_retries=1,
+        on_ydb_error_callback=mock.Mock(),
+    )
+    retry_once_settings.unknown_error_handler = mock.Mock()
+
+    def get_results(callee):
+        res_generator = retry_operation_impl(callee, retry_settings=retry_once_settings)
+        results = []
+        exc = None
+        try:
+            for res in res_generator:
+                results.append(res)
+                if isinstance(res, YdbRetryOperationFinalResult):
+                    break
+        except Exception as e:
+            exc = e
+
+        return results, exc
+
+    class TestException(Exception):
+        def __init__(self, message):
+            super(TestException, self).__init__(message)
+            self.message = message
+
+        def __eq__(self, other):
+            return type(self) is type(other) and self.message == other.message
+
+    def check_unretriable_error(err_type, call_ydb_handler):
+        retry_once_settings.on_ydb_error_callback.reset_mock()
+        retry_once_settings.unknown_error_handler.reset_mock()
+
+        results = get_results(mock.Mock(side_effect=[err_type("test1"), err_type("test2")]))
+        yields = results[0]
+        exc = results[1]
+
+        assert yields == []
+        assert exc == err_type("test1")
+
+        if call_ydb_handler:
+            assert retry_once_settings.on_ydb_error_callback.call_count == 1
+            retry_once_settings.on_ydb_error_callback.assert_called_with(err_type("test1"))
+
+            assert retry_once_settings.unknown_error_handler.call_count == 0
+        else:
+            assert retry_once_settings.on_ydb_error_callback.call_count == 0
+
+            assert retry_once_settings.unknown_error_handler.call_count == 1
+            retry_once_settings.unknown_error_handler.assert_called_with(err_type("test1"))
+
+    def check_retriable_error(err_type, backoff):
+        retry_once_settings.on_ydb_error_callback.reset_mock()
+
+        results = get_results(mock.Mock(side_effect=[err_type("test1"), err_type("test2")]))
+        yields = results[0]
+        exc = results[1]
+
+        if backoff:
+            assert [
+                YdbRetryOperationSleepOpt(backoff.calc_timeout(0)),
+                YdbRetryOperationSleepOpt(backoff.calc_timeout(1)),
+            ] == yields
+        else:
+            # Skip-yield error types (Aborted/BadSession/NotFound/InternalError): impl emits
+            # SleepOpt(0.0) markers so consumers can rotate per-attempt bookkeeping
+            # (e.g. ``ydb.Try`` spans get backoff_ms=0).
+            assert [YdbRetryOperationSleepOpt(0.0), YdbRetryOperationSleepOpt(0.0)] == yields
+
+        assert exc == err_type("test2")
+
+        assert retry_once_settings.on_ydb_error_callback.call_count == 2
+        retry_once_settings.on_ydb_error_callback.assert_any_call(err_type("test1"))
+        retry_once_settings.on_ydb_error_callback.assert_called_with(err_type("test2"))
+
+        assert retry_once_settings.unknown_error_handler.call_count == 0
+
+    # check ok
+    assert get_results(lambda: True) == ([YdbRetryOperationFinalResult(True)], None)
+
+    # check retry error and return result
+    assert get_results(mock.Mock(side_effect=[issues.Overloaded("test"), True])) == (
+        [
+            YdbRetryOperationSleepOpt(retry_once_settings.slow_backoff.calc_timeout(0)),
+            YdbRetryOperationFinalResult(True),
+        ],
+        None,
+    )
+
+    # check errors
+    check_retriable_error(issues.Aborted, None)
+    check_retriable_error(issues.BadSession, None)
+
+    check_retriable_error(issues.NotFound, None)
+    with mock.patch.object(retry_once_settings, "retry_not_found", False):
+        check_unretriable_error(issues.NotFound, True)
+
+    check_retriable_error(issues.InternalError, None)
+    with mock.patch.object(retry_once_settings, "retry_internal_error", False):
+        check_unretriable_error(issues.InternalError, True)
+
+    check_retriable_error(issues.Overloaded, retry_once_settings.slow_backoff)
+    check_retriable_error(issues.SessionPoolEmpty, retry_once_settings.slow_backoff)
+    check_retriable_error(issues.ConnectionError, retry_once_settings.slow_backoff)
+
+    check_retriable_error(issues.Unavailable, retry_once_settings.fast_backoff)
+
+    check_unretriable_error(issues.Undetermined, True)
+    with mock.patch.object(retry_once_settings, "idempotent", True):
+        check_retriable_error(issues.Unavailable, retry_once_settings.fast_backoff)
+
+    check_unretriable_error(issues.Error, True)
+    with mock.patch.object(retry_once_settings, "idempotent", True):
+        check_unretriable_error(issues.Error, True)
+
+    check_unretriable_error(TestException, False)
+    with mock.patch.object(retry_once_settings, "idempotent", True):
+        check_unretriable_error(TestException, False)
+
+
+def _build_describe_system_view_response():
+    result = _apis.ydb_table.DescribeSystemViewResult()
+    result.self.name = "partition_stats"
+    result.self.type = scheme.SchemeEntryType.SYS_VIEW
+    result.sys_view_id = 42
+    result.sys_view_name = "partition_stats"
+    column = result.columns.add()
+    column.name = "OwnerId"
+    column.type.type_id = types.PrimitiveType.Uint64._idn_
+    result.primary_key.append("OwnerId")
+    result.attributes["origin"] = "test"
+
+    response = _apis.ydb_table.DescribeSystemViewResponse()
+    response.operation.status = _apis.StatusIds.SUCCESS
+    response.operation.result.Pack(result)
+    return response
+
+
+def test_describe_system_view_request_factory():
+    request = _session_impl.describe_system_view_request_factory("/local/.sys/partition_stats")
+    assert request.path == "/local/.sys/partition_stats"
+    # DescribeSystemView is stateless: the request carries no session id.
+    assert not hasattr(request, "session_id")
+
+
+def test_wrap_describe_system_view_response():
+    entry = _session_impl.wrap_describe_system_view_response(
+        None, _build_describe_system_view_response(), SystemViewSchemeEntry
+    )
+
+    assert isinstance(entry, SystemViewSchemeEntry)
+    assert entry.name == "partition_stats"
+    assert entry.is_sysview()
+    assert entry.sys_view_id == 42
+    assert entry.sys_view_name == "partition_stats"
+    assert entry.primary_key == ["OwnerId"]
+    assert [column.name for column in entry.columns] == ["OwnerId"]
+    assert dict(entry.attributes) == {"origin": "test"}
+
+
+def test_wrap_describe_system_view_response_raises_on_error():
+    response = _apis.ydb_table.DescribeSystemViewResponse()
+    response.operation.status = _apis.StatusIds.SCHEME_ERROR
+    with pytest.raises(issues.SchemeError):
+        _session_impl.wrap_describe_system_view_response(None, response, SystemViewSchemeEntry)
+
+
+def test_async_describe_system_view():
+    class _FakeSyncDriver:
+        def future(self, request, stub, method, wrap_fn, settings, wrap_args, *rest):
+            self.request = request
+            self.method = method
+            return wrap_fn(None, _build_describe_system_view_response(), *wrap_args)
+
+    driver = _FakeSyncDriver()
+    entry = TableClient(driver).async_describe_system_view("/local/.sys/partition_stats")
+
+    assert driver.method == _apis.TableService.DescribeSystemView
+    assert driver.request.path == "/local/.sys/partition_stats"
+    assert isinstance(entry, SystemViewSchemeEntry)
+    assert entry.sys_view_name == "partition_stats"
+
+
+class _FakeScanQueryDriver:
+    def __call__(self, request, stub, method, settings=None):
+        self.request = request
+        self.method = method
+        return iter(())
+
+
+class _FakeAsyncScanQueryDriver:
+    async def __call__(self, request, stub, method, settings=None):
+        self.request = request
+        self.method = method
+        return _EmptyAsyncStream()
+
+
+class _EmptyAsyncStream:
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        raise StopAsyncIteration
+
+
+def test_scan_query_warns_and_still_returns_iterator():
+    driver = _FakeScanQueryDriver()
+
+    with pytest.warns(DeprecationWarning) as record:
+        stream = TableClient(driver).scan_query("SELECT 1")
+
+    assert str(record[0].message) == (
+        "scan_query is deprecated and will be removed in a future release, "
+        "use QueryService (ydb.QuerySessionPool) instead"
+    )
+    assert driver.method == _apis.TableService.StreamExecuteScanQuery
+    assert isinstance(stream, _utilities.SyncResponseIterator)
+
+
+def test_async_scan_query_warns_and_still_returns_iterator():
+    driver = _FakeScanQueryDriver()
+
+    with pytest.warns(DeprecationWarning) as record:
+        stream = TableClient(driver).async_scan_query("SELECT 1")
+
+    assert str(record[0].message) == (
+        "async_scan_query is deprecated and will be removed in a future release, "
+        "use QueryService (ydb.QuerySessionPool) instead"
+    )
+    assert driver.method == _apis.TableService.StreamExecuteScanQuery
+    assert isinstance(stream, _utilities.AsyncResponseIterator)
+
+
+@pytest.mark.asyncio
+async def test_aio_scan_query_warns_and_points_to_async_pool():
+    driver = _FakeAsyncScanQueryDriver()
+
+    with pytest.warns(DeprecationWarning) as record:
+        stream = await AioTableClient(driver).scan_query("SELECT 1")
+
+    # The async client must not send users to the sync session pool.
+    assert str(record[0].message) == (
+        "scan_query is deprecated and will be removed in a future release, "
+        "use QueryService (ydb.aio.QuerySessionPool) instead"
+    )
+    assert driver.method == _apis.TableService.StreamExecuteScanQuery
+    assert isinstance(stream, _aio_utilities.AsyncResponseIterator)
+
+
+def _read_rows_key_types():
+    return types.BulkUpsertColumns().add_column("id", types.PrimitiveType.Uint64)
+
+
+def _build_read_rows_response():
+    response = _apis.ydb_table.ReadRowsResponse()
+    response.status = _apis.StatusIds.SUCCESS
+    id_column = response.result_set.columns.add()
+    id_column.name = "id"
+    id_column.type.type_id = types.PrimitiveType.Uint64._idn_
+    value_column = response.result_set.columns.add()
+    value_column.name = "value"
+    value_column.type.type_id = types.PrimitiveType.Utf8._idn_
+    row = response.result_set.rows.add()
+    row.items.add().uint64_value = 1
+    row.items.add().text_value = "alice"
+    return response
+
+
+def test_read_rows_request_factory():
+    keys = [{"id": 1}, {"id": 2}]
+    request = _session_impl.read_rows_request_factory(
+        "/local/users", keys, _read_rows_key_types(), columns=("id", "value")
+    )
+
+    assert request.path == "/local/users"
+    # ReadRows is stateless: the request carries no session id.
+    assert request.session_id == ""
+    assert list(request.columns) == ["id", "value"]
+    assert request.keys.type.list_type.item.struct_type.members[0].name == "id"
+    assert [item.items[0].uint64_value for item in request.keys.value.items] == [1, 2]
+
+
+def test_read_rows_request_factory_without_columns():
+    request = _session_impl.read_rows_request_factory("/local/users", [{"id": 1}], _read_rows_key_types())
+    assert list(request.columns) == []
+
+
+def test_wrap_read_rows_response():
+    result_set = _session_impl.wrap_read_rows_response(None, _build_read_rows_response())
+
+    assert [column.name for column in result_set.columns] == ["id", "value"]
+    assert len(result_set.rows) == 1
+    assert result_set.rows[0].id == 1
+    assert result_set.rows[0].value == "alice"
+
+
+def test_wrap_read_rows_response_raises_on_error():
+    response = _apis.ydb_table.ReadRowsResponse()
+    response.status = _apis.StatusIds.SCHEME_ERROR
+    with pytest.raises(issues.SchemeError):
+        _session_impl.wrap_read_rows_response(None, response)
+
+
+def test_async_read_rows():
+    class _FakeSyncDriver:
+        def future(self, request, stub, method, wrap_fn, settings, wrap_args, *rest):
+            self.request = request
+            self.method = method
+            return wrap_fn(None, _build_read_rows_response(), *wrap_args)
+
+    driver = _FakeSyncDriver()
+    result_set = TableClient(driver).async_read_rows(
+        "/local/users", [{"id": 1}], _read_rows_key_types(), columns=("id", "value")
+    )
+
+    assert driver.method == _apis.TableService.ReadRows
+    assert driver.request.path == "/local/users"
+    assert list(driver.request.columns) == ["id", "value"]
+    assert result_set.rows[0].id == 1
+    assert result_set.rows[0].value == "alice"
+
+
+def test_read_rows():
+    class _FakeSyncDriver:
+        def __call__(self, request, stub, method, wrap_fn, settings, wrap_args, *rest):
+            self.request = request
+            self.method = method
+            return wrap_fn(None, _build_read_rows_response(), *wrap_args)
+
+    driver = _FakeSyncDriver()
+    result_set = TableClient(driver).read_rows(
+        "/local/users", [{"id": 1}], _read_rows_key_types(), columns=("id", "value")
+    )
+
+    assert driver.method == _apis.TableService.ReadRows
+    assert driver.request.path == "/local/users"
+    assert list(driver.request.columns) == ["id", "value"]
+    assert result_set.rows[0].id == 1
+    assert result_set.rows[0].value == "alice"
+
+
+def _read_table_session_state():
+    state = _session_impl.SessionState(TableClientSettings())
+    state.set_id("test-session-id")
+    return state
+
+
+def test_read_table_request_not_null_as_optional_enabled():
+    request = _session_impl.read_table_request_factory(
+        _read_table_session_state(), "/local/table", return_not_null_data_as_optional=True
+    )
+    assert request.return_not_null_data_as_optional == _apis.FeatureFlag.ENABLED
+
+
+def test_read_table_request_not_null_as_optional_disabled():
+    request = _session_impl.read_table_request_factory(
+        _read_table_session_state(), "/local/table", return_not_null_data_as_optional=False
+    )
+    assert request.return_not_null_data_as_optional == _apis.FeatureFlag.DISABLED
+
+
+def test_read_table_request_not_null_as_optional_unset_by_default():
+    request = _session_impl.read_table_request_factory(_read_table_session_state(), "/local/table")
+    assert request.return_not_null_data_as_optional == _apis.FeatureFlag.STATUS_UNSPECIFIED
+
+
+def test_read_table_request_not_null_as_optional_raw_status():
+    # A raw FeatureFlag.Status (not a bool) is passed through unchanged.
+    request = _session_impl.read_table_request_factory(
+        _read_table_session_state(),
+        "/local/table",
+        return_not_null_data_as_optional=_apis.FeatureFlag.DISABLED,
+    )
+    assert request.return_not_null_data_as_optional == _apis.FeatureFlag.DISABLED
